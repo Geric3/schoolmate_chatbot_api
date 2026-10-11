@@ -11,6 +11,7 @@ from services import faq_service, rag_service, llm_service
 router = APIRouter()
 
 
+
 @router.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, ctx: AuthContext = Depends(get_auth_context)):
     message = req.message.strip()
