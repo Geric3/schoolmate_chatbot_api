@@ -10,7 +10,11 @@ from services import faq_service, rag_service, context_builder as cb
 router = APIRouter(prefix="/admin")
 
 
-def _admin_only(ctx: AuthContext) -> AuthContext:
+# def _admin_only(ctx: AuthContext) -> AuthContext:
+#     require_role(ctx, "admin", "university")
+#     return ctx
+
+def _admin_only(ctx: AuthContext = Depends(get_auth_context)) -> AuthContext:
     require_role(ctx, "admin", "university")
     return ctx
 

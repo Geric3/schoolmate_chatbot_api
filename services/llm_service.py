@@ -66,8 +66,8 @@ def _dispatch(messages: list[dict]) -> str | None:
         if result:
             return result
     # last resort fallback if the primary provider is unset/unreachable
-    if settings.OPENAI_API_KEY:
-        return _call(OPENAI_URL, settings.OPENAI_API_KEY, settings.OPENAI_MODEL, messages)
+    # if settings.OPENAI_API_KEY:
+    #     return _call(OPENAI_URL, settings.OPENAI_API_KEY, settings.OPENAI_MODEL, messages)
     return None
 
 
@@ -94,16 +94,18 @@ def answer_with_documents(lang: str, user_question: str, chunks: list[dict]) -> 
     system = BASE_SYSTEM_PROMPT.get(lang, BASE_SYSTEM_PROMPT["fr"])
     context = "\n---\n".join(f"[{c['title']}] {c['text']}" for c in chunks)
     instruction = (
-        "Réponds à la question UNIQUEMENT à partir des extraits de documents "
-        "ci-dessous. Si les extraits ne permettent pas de répondre, dis-le "
-        "clairement plutôt que d'inventer."
+        "Réponds à la question UNIQUEMENT à partir des extraits ci-dessous. "
+        "Si les extraits ne contiennent pas la réponse, réponds exactement : NO_ANSWER"
         if lang == "fr" else
-        "Answer the question using ONLY the document excerpts below. If they "
-        "don't contain the answer, say so clearly rather than guessing."
+        "Answer the question using ONLY the excerpts below. "
+        "If they don't contain the answer, reply exactly: NO_ANSWER"
     )
     user_msg = f"{instruction}\n\nExtraits:\n{context}\n\nQuestion: {user_question}"
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user_msg}]
-    return _dispatch(messages)
+    reply = _dispatch(messages)
+    if not reply or "NO_ANSWER" in reply:
+        return None
+    return reply
 
 
 def answer_general(lang: str, user_question: str) -> str:

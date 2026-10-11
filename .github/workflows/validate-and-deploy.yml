@@ -1,0 +1,56 @@
+name: Validate and deploy
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build --tag schoolmate-chatbot-api:ci .
+
+      - name: Smoke-test API
+        run: |
+          set -eu
+          trap 'docker rm --force schoolmate-chatbot-api-ci >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name schoolmate-chatbot-api-ci \
+            --env JWT_SECRET=ci-smoke-test-secret \
+            --publish 127.0.0.1:8000:8000 \
+            schoolmate-chatbot-api:ci
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8000/health; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs schoolmate-chatbot-api-ci
+          exit 1
+
+  deploy:
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deployment
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK" ]; then
+            echo "Missing GitHub Actions secret RENDER_DEPLOY_HOOK."
+            echo "Add the Render deploy hook URL in the repository Actions secrets."
+            exit 1
+          fi
+          curl --fail --silent --show-error --max-time 30 \
+            --request POST "$RENDER_DEPLOY_HOOK"

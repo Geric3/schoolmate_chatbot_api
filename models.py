@@ -13,7 +13,7 @@ class ChatResponse(BaseModel):
 
 
 class FaqIn(BaseModel):
-    question_key: str = Field(..., max_length=50)
+    question_key: str = Field(..., max_length=255)
     answer: str
     lang: str = "fr"
 

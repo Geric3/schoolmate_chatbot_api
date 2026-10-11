@@ -37,26 +37,14 @@ def chat(req: ChatRequest, ctx: AuthContext = Depends(get_auth_context)):
         intent = intent_service.classify(message)
         answer, source = None, None
 
-        if intent and ctx.role == "student" and student:
+        if intent and intent.name == "announcements":
+            answer, source = _handle_announcements(conn, ctx, message, lang)
+        elif intent and ctx.role == "student" and student:
             answer, source = _handle_student_intent(conn, intent, message, lang, student)
         elif intent and ctx.role == "teacher":
             answer, source = _handle_teacher_intent(conn, intent, message, lang, ctx)
         elif intent and ctx.role in ("admin", "university"):
             answer, source = _handle_admin_intent(conn, intent, message, lang)
-        elif intent and intent.name == "announcements":
-            audience = "students" if ctx.role == "student" else ("teachers" if ctx.role == "teacher" else "all")
-            items = cb.get_announcements(conn, audience=audience)
-            if not items:
-                # règlement intérieur / announcement text might live as an uploaded document instead
-                doc = rag_service.get_document_by_title_fragment(conn, "reglement") or \
-                      rag_service.get_document_by_title_fragment(conn, "règlement") or \
-                      rag_service.get_document_by_title_fragment(conn, "annonce")
-                if doc:
-                    answer = llm_service.answer_with_documents(lang, message, doc)
-                    source = "documents"
-            else:
-                answer = llm_service.polish_structured_answer(lang, message, {"announcements": items})
-                source = "structured_data"
 
         # --- 3. Local FAQ table ---
         if not answer:
@@ -152,4 +140,16 @@ def _handle_admin_intent(conn, intent, message, lang):
     if intent.name == "institution_stats":
         stats = cb.get_institution_stats(conn)
         return llm_service.polish_structured_answer(lang, message, stats), "structured_data"
+    return None, None
+
+def _handle_announcements(conn, ctx, message, lang):
+    audience = "students" if ctx.role == "student" else ("teachers" if ctx.role == "teacher" else "all")
+    items = cb.get_announcements(conn, audience=audience)
+    if items:
+        return llm_service.polish_structured_answer(lang, message, {"announcements": items}), "structured_data"
+    chunks = rag_service.search_documents(conn, message)
+    if chunks:
+        ans = llm_service.answer_with_documents(lang, message, chunks)
+        if ans:
+            return ans, "documents"
     return None, None

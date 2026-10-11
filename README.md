@@ -45,14 +45,49 @@ Run `migrations/001_chatbot_tables.sql` on **every tenant database**
 (`universities.db_name`), and fold it into whatever script creates a new
 university's database, so new tenants get the chatbot tables automatically.
 
+## Container and continuous deployment
+
+Run the API locally with Docker Compose:
+
+```bash
+cp .env.example .env
+# Fill in the values in .env, then:
+docker compose up --build
+```
+
+The container listens on port `8000` by default. Compose publishes it on
+`PORT` (or `8000` if `PORT` is unset). Never commit `.env`; configure production
+values as environment variables in Render.
+
+Every push to GitHub and every pull request targeting `master` runs the
+validation: GitHub Actions builds the Docker image and starts it with a test
+`JWT_SECRET`, then checks `GET /health`. Only a push to `master` triggers
+Render, and only after the checks pass.
+
+To enable gated deployment:
+
+1. Configure the Render web service to use the repository's **Docker** runtime
+   and its `Dockerfile`. If the current Render service uses a different
+   runtime, create a Docker web service for this repository.
+2. Turn off Render's automatic deploy-on-push setting so it cannot deploy
+   before GitHub Actions has validated the changes.
+3. Create a Render deploy hook for the service. Add its URL in the GitHub
+   repository under **Settings → Secrets and variables → Actions** as the
+   `RENDER_DEPLOY_HOOK` secret.
+4. Add the API's production environment variables (including `JWT_SECRET`) to
+   the Render service, and make sure GitHub Actions is enabled for the repo.
+
+After that, merges or pushes to `master` validate first, then ask Render to
+deploy. A pull request never triggers the deploy hook.
+
 ## Deploying
 
-- **Render**: create a Web Service from this folder, build command
-  `pip install -r requirements.txt`, start command
-  `uvicorn main:app --host 0.0.0.0 --port $PORT`. Add the env vars from
-  `.env.example` in the dashboard. Make sure Hostinger's MySQL "Remote MySQL"
-  access list includes Render's outbound IPs (or allow `%` if your host
-  supports it, with a strong DB password).
+- **Render without GitHub Actions deployment gating**: use the Docker runtime
+  described above, or configure the Python build command
+  `pip install -r requirements.txt` and start command
+  `uvicorn main:app --host 0.0.0.0 --port $PORT`. Add the environment variables
+  in the dashboard. Make sure the MySQL host's remote-access rules allow
+  Render to connect.
 - **PythonAnywhere**: upload the folder, create a virtualenv, install
   `requirements.txt`, and point the WSGI file at `main:app` via
   `a2wsgi`/`asgiref` (PythonAnywhere's free tier serves WSGI; wrap the ASGI

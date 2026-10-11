@@ -1,35 +1,39 @@
 """
-Retrieval-augmented answers over admin-uploaded institute documents
-(reglement interieur, procedures, guides, etc.).
-
-Storage: `chatbot_documents` (one row per uploaded document) +
-`chatbot_document_chunks` (its text split into ~700-char overlapping
-chunks).
-
-Deliberately dependency-light: no embeddings/vector DB, just a TF-style
-word-overlap score over chunks. This is enough for a few dozen documents of
-a few pages each and keeps the app deployable on a free Render/
-PythonAnywhere instance with no extra native libraries. It can be swapped
-for a real vector store later without touching the rest of the app - only
-`search_documents` would need to change.
+RAG léger sur les documents de l'institut (règlement, procédures, guides...).
+Amélioration : stopwords FR/EN + normalisation des accents, pour que
+« règlement » et « reglement » se correspondent et que les mots vides
+(« comment », « quelle »...) ne faussent plus le score.
 """
 import re
+import unicodedata
 from collections import Counter
 from typing import Optional
 
 _WORD_RE = re.compile(r"[a-zA-ZÀ-ÿ0-9]+")
-CHUNK_SIZE = 700  # characters
+CHUNK_SIZE = 700
 CHUNK_OVERLAP = 100
+
+_STOP = {
+    "le", "la", "les", "des", "une", "est", "que", "qui", "quoi", "quel", "quelle",
+    "quels", "quelles", "comment", "pour", "avec", "dans", "sur", "mon", "mes",
+    "ces", "cette", "aux", "par", "pas", "ont", "sont", "elle", "nous", "vous",
+    "the", "and", "for", "with", "what", "how", "does", "are", "this", "that",
+    "can", "you", "your", "from", "have", "has", "was", "were", "who", "when",
+}
+
+
+def _norm(text: str) -> str:
+    return unicodedata.normalize("NFD", text.lower()).encode("ascii", "ignore").decode()
 
 
 def _tokenize(text: str) -> Counter:
-    return Counter(w.lower() for w in _WORD_RE.findall(text) if len(w) > 2)
+    words = (_norm(w) for w in _WORD_RE.findall(text))
+    return Counter(w for w in words if len(w) > 2 and w not in _STOP)
 
 
 def chunk_text(text: str) -> list[str]:
     text = re.sub(r"\s+", " ", text).strip()
-    chunks = []
-    start = 0
+    chunks, start = [], 0
     while start < len(text):
         end = min(start + CHUNK_SIZE, len(text))
         chunks.append(text[start:end])
@@ -46,10 +50,9 @@ def create_document(conn, title: str, content: str, uploaded_by: Optional[int] =
             (title, uploaded_by),
         )
         document_id = cur.lastrowid
-        chunks = chunk_text(content)
         cur.executemany(
             "INSERT INTO chatbot_document_chunks (document_id, chunk_index, chunk_text) VALUES (%s, %s, %s)",
-            [(document_id, i, c) for i, c in enumerate(chunks)],
+            [(document_id, i, c) for i, c in enumerate(chunk_text(content))],
         )
     return document_id
 
@@ -69,14 +72,12 @@ def list_documents(conn) -> list[dict]:
 def delete_document(conn, document_id: int) -> None:
     with conn.cursor() as cur:
         cur.execute("DELETE FROM chatbot_documents WHERE id = %s", (document_id,))
-        # chatbot_document_chunks rows are removed via ON DELETE CASCADE, see migration
 
 
-def search_documents(conn, query: str, top_k: int = 3, min_score: float = 0.15) -> list[dict]:
+def search_documents(conn, query: str, top_k: int = 3, min_score: float = 0.25) -> list[dict]:
     q_tokens = _tokenize(query)
     if not q_tokens:
         return []
-
     with conn.cursor() as cur:
         cur.execute(
             """SELECT d.title, c.chunk_text FROM chatbot_document_chunks c
@@ -89,11 +90,10 @@ def search_documents(conn, query: str, top_k: int = 3, min_score: float = 0.15) 
         chunk_tokens = _tokenize(row["chunk_text"])
         if not chunk_tokens:
             continue
-        overlap = sum((q_tokens & chunk_tokens).values())
-        score = overlap / max(len(q_tokens), 1)
+        overlap = len((q_tokens.keys() & chunk_tokens.keys()))
+        score = overlap / len(q_tokens)
         if score >= min_score:
             scored.append({"title": row["title"], "text": row["chunk_text"], "score": round(score, 2)})
-
     scored.sort(key=lambda r: r["score"], reverse=True)
     return scored[:top_k]
 
@@ -107,4 +107,5 @@ def get_document_by_title_fragment(conn, fragment: str) -> Optional[list[dict]]:
             (f"%{fragment}%",),
         )
         rows = cur.fetchall()
-    return rows or None
+    # même format que search_documents (clé "text") pour llm_service
+    return [{"title": r["title"], "text": r["chunk_text"], "score": 1.0} for r in rows] or None
