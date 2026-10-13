@@ -33,6 +33,8 @@ BASE_SYSTEM_PROMPT = {
     ),
 }
 
+DOC_MAX_TOKENS = 1000   # les réponses tirées des documents sont plus longues que 500 tokens
+
 
 def _call(url: str, api_key: str, model: str, messages: list[dict], max_tokens: int = 500) -> str:
     headers = {
@@ -56,18 +58,15 @@ def _call(url: str, api_key: str, model: str, messages: list[dict], max_tokens: 
         return None
 
 
-def _dispatch(messages: list[dict]) -> str | None:
+def _dispatch(messages: list[dict], max_tokens: int = 500) -> str | None:
     if settings.LLM_PROVIDER == "openai" and settings.OPENAI_API_KEY:
-        result = _call(OPENAI_URL, settings.OPENAI_API_KEY, settings.OPENAI_MODEL, messages)
+        result = _call(OPENAI_URL, settings.OPENAI_API_KEY, settings.OPENAI_MODEL, messages, max_tokens)
         if result:
             return result
     if settings.GROQ_API_KEY:
-        result = _call(GROQ_URL, settings.GROQ_API_KEY, settings.GROQ_MODEL, messages)
+        result = _call(GROQ_URL, settings.GROQ_API_KEY, settings.GROQ_MODEL, messages, max_tokens)
         if result:
             return result
-    # last resort fallback if the primary provider is unset/unreachable
-    # if settings.OPENAI_API_KEY:
-    #     return _call(OPENAI_URL, settings.OPENAI_API_KEY, settings.OPENAI_MODEL, messages)
     return None
 
 
@@ -90,19 +89,46 @@ def polish_structured_answer(lang: str, user_question: str, facts: dict) -> str:
     return result or _fallback_render(lang, facts)
 
 
-def answer_with_documents(lang: str, user_question: str, chunks: list[dict]) -> str | None:
+def answer_with_documents(lang: str, user_question: str, chunks: list[dict],
+                          previous_answer: str | None = None) -> str | None:
+    """Répond à partir des extraits. Retourne None si les extraits ne contiennent pas la réponse
+    (le chatbot passe alors à l'étape suivante au lieu d'afficher « je ne sais pas »).
+    `previous_answer` : ce qui a déjà été affiché, pour compléter sans répéter (« la suite »)."""
     system = BASE_SYSTEM_PROMPT.get(lang, BASE_SYSTEM_PROMPT["fr"])
     context = "\n---\n".join(f"[{c['title']}] {c['text']}" for c in chunks)
-    instruction = (
-        "Réponds à la question UNIQUEMENT à partir des extraits ci-dessous. "
-        "Si les extraits ne contiennent pas la réponse, réponds exactement : NO_ANSWER"
-        if lang == "fr" else
-        "Answer the question using ONLY the excerpts below. "
-        "If they don't contain the answer, reply exactly: NO_ANSWER"
-    )
-    user_msg = f"{instruction}\n\nExtraits:\n{context}\n\nQuestion: {user_question}"
+
+    if lang == "fr":
+        instruction = (
+            "Réponds à la question UNIQUEMENT à partir des extraits ci-dessous, de façon complète et "
+            "structurée (listes à puces si le texte en contient). Ne résume pas à l'excès : conserve les "
+            "chiffres, conditions et exceptions. Ne mentionne pas les « extraits ». "
+            "Si les extraits ne contiennent pas la réponse, réponds exactement : NO_ANSWER"
+        )
+        if previous_answer:
+            instruction = (
+                "Voici la SUITE des passages pertinents du document. Déjà affiché à l'utilisateur :\n"
+                f"<<<{previous_answer}>>>\n"
+                "Complète avec les informations NOUVELLES de ces extraits, sans répéter ce qui a déjà été "
+                "dit, de façon structurée. S'il n'y a rien de nouveau, réponds exactement : NO_ANSWER"
+            )
+        user_msg = f"{instruction}\n\nExtraits:\n{context}\n\nQuestion: {user_question}"
+    else:
+        instruction = (
+            "Answer the question using ONLY the excerpts below, completely and in a structured way "
+            "(bullet lists if the text has them). Do not over-summarise: keep figures, conditions and "
+            "exceptions. Do not mention 'excerpts'. If they don't contain the answer, reply exactly: NO_ANSWER"
+        )
+        if previous_answer:
+            instruction = (
+                "Here is the CONTINUATION of the relevant passages. Already shown to the user:\n"
+                f"<<<{previous_answer}>>>\n"
+                "Add the NEW information from these excerpts without repeating what was said, in a "
+                "structured way. If there is nothing new, reply exactly: NO_ANSWER"
+            )
+        user_msg = f"{instruction}\n\nExcerpts:\n{context}\n\nQuestion: {user_question}"
+
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user_msg}]
-    reply = _dispatch(messages)
+    reply = _dispatch(messages, max_tokens=DOC_MAX_TOKENS)
     if not reply or "NO_ANSWER" in reply:
         return None
     return reply

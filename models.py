@@ -18,8 +18,13 @@ class FaqIn(BaseModel):
     lang: str = "fr"
 
 
+# class FaqOut(FaqIn):
+#     id: int
+
 class FaqOut(FaqIn):
     id: int
+    lang: Optional[str] = "fr"        
+
 
 
 class DocumentIn(BaseModel):
@@ -40,8 +45,14 @@ class AnnouncementIn(BaseModel):
     audience: str = "all"  # all | students | teachers
 
 
+# class UnansweredOut(BaseModel):
+#     id: int
+#     question: str
+#     answer: str
+#     timestamp: Optional[str] = None
+
 class UnansweredOut(BaseModel):
     id: int
     question: str
-    answer: str
+    answer: Optional[str] = ""        
     timestamp: Optional[str] = None

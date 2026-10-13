@@ -1,9 +1,11 @@
 """
-RAG léger sur les documents de l'institut (règlement, procédures, guides...).
-Amélioration : stopwords FR/EN + normalisation des accents, pour que
-« règlement » et « reglement » se correspondent et que les mots vides
-(« comment », « quelle »...) ne faussent plus le score.
+Réponses augmentées par les documents de l'institut (règlement, procédures, guides...).
+
+Recherche sans dépendance lourde : mots normalisés (sans accents ni pluriels) et
+pondération TF-IDF simplifiée -> un mot rare (« redoublement ») compte plus qu'un mot
+courant (« institut »), ce qui retrouve beaucoup mieux le bon passage.
 """
+import math
 import re
 import unicodedata
 from collections import Counter
@@ -14,21 +16,31 @@ CHUNK_SIZE = 700
 CHUNK_OVERLAP = 100
 
 _STOP = {
-    "le", "la", "les", "des", "une", "est", "que", "qui", "quoi", "quel", "quelle",
-    "quels", "quelles", "comment", "pour", "avec", "dans", "sur", "mon", "mes",
-    "ces", "cette", "aux", "par", "pas", "ont", "sont", "elle", "nous", "vous",
-    "the", "and", "for", "with", "what", "how", "does", "are", "this", "that",
-    "can", "you", "your", "from", "have", "has", "was", "were", "who", "when",
+    "les", "des", "une", "est", "sont", "que", "qui", "quoi", "quel", "quels", "quelle",
+    "quelles", "comment", "pour", "avec", "dans", "sur", "mon", "mes", "ces", "cette", "aux",
+    "par", "pas", "ont", "elle", "nous", "vous", "voudrais", "veux", "peux", "svp",
+    "bonjour", "bonsoir", "salut",
+    "the", "and", "for", "with", "what", "how", "does", "are", "this", "that", "can", "you",
+    "your", "from", "have", "has", "was", "were", "who", "when", "please", "hello",
 }
 
 
 def _norm(text: str) -> str:
-    return unicodedata.normalize("NFD", text.lower()).encode("ascii", "ignore").decode()
+    return "".join(c for c in unicodedata.normalize("NFD", text.lower()) if unicodedata.category(c) != "Mn")
+
+
+_STOP = {_norm(w) for w in _STOP}
+
+
+def _stem(word: str) -> str:
+    if len(word) > 4 and word.endswith(("s", "x")):
+        return word[:-1]
+    return word
 
 
 def _tokenize(text: str) -> Counter:
     words = (_norm(w) for w in _WORD_RE.findall(text))
-    return Counter(w for w in words if len(w) > 2 and w not in _STOP)
+    return Counter(_stem(w) for w in words if len(w) > 2 and w not in _STOP)
 
 
 def chunk_text(text: str) -> list[str]:
@@ -74,28 +86,71 @@ def delete_document(conn, document_id: int) -> None:
         cur.execute("DELETE FROM chatbot_documents WHERE id = %s", (document_id,))
 
 
-def search_documents(conn, query: str, top_k: int = 3, min_score: float = 0.25) -> list[dict]:
-    q_tokens = _tokenize(query)
-    if not q_tokens:
+def rank_chunks(rows: list[dict], query: str, top_k: int = 3, min_score: float = 0.3,
+                relative_min: float = 0.0) -> list[dict]:
+    """Classe les passages (fonction pure, testable sans base de données)."""
+    q_tokens = set(_tokenize(query))
+    if not q_tokens or not rows:
         return []
-    with conn.cursor() as cur:
-        cur.execute(
-            """SELECT d.title, c.chunk_text FROM chatbot_document_chunks c
-               JOIN chatbot_documents d ON d.id = c.document_id"""
-        )
-        rows = cur.fetchall()
+
+    n = len(rows)
+    token_sets = [set(_tokenize(r["chunk_text"])) for r in rows]
+    df = Counter()
+    for ts in token_sets:
+        df.update(ts)
+
+    # Poids IDF ; un mot de la question absent de tous les documents compte pour moitié
+    weights = {t: math.log(1 + n / (1 + df[t])) * (1.0 if df[t] else 0.5) for t in q_tokens}
+    total = sum(weights.values())
+    if total <= 0:
+        return []
 
     scored = []
-    for row in rows:
-        chunk_tokens = _tokenize(row["chunk_text"])
-        if not chunk_tokens:
-            continue
-        overlap = len((q_tokens.keys() & chunk_tokens.keys()))
-        score = overlap / len(q_tokens)
+    for row, ts in zip(rows, token_sets):
+        score = sum(weights[t] for t in q_tokens if t in ts) / total
         if score >= min_score:
-            scored.append({"title": row["title"], "text": row["chunk_text"], "score": round(score, 2)})
+            scored.append({
+                "id": row.get("id"), "doc_id": row.get("document_id"),
+                "chunk_index": row.get("chunk_index", 0),
+                "title": row["title"], "text": row["chunk_text"], "score": round(score, 3),
+            })
     scored.sort(key=lambda r: r["score"], reverse=True)
+    if scored and relative_min:
+        best = scored[0]["score"]
+        scored = [s for s in scored if s["score"] >= best * relative_min]
     return scored[:top_k]
+
+
+def search_documents(conn, query: str, top_k: int = 3, min_score: float = 0.3,
+                     relative_min: float = 0.0) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT c.id, c.document_id, c.chunk_index, d.title, c.chunk_text
+               FROM chatbot_document_chunks c JOIN chatbot_documents d ON d.id = c.document_id"""
+        )
+        rows = cur.fetchall()
+    return rank_chunks(rows, query, top_k, min_score, relative_min)
+
+
+def get_chunks_by_ids(conn, ids: list[int]) -> list[dict]:
+    """Relit des passages précis (suite d'une réponse), dans l'ordre demandé."""
+    ids = [int(i) for i in ids]
+    if not ids:
+        return []
+    placeholders = ",".join(["%s"] * len(ids))
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""SELECT c.id, c.document_id, c.chunk_index, d.title, c.chunk_text
+                FROM chatbot_document_chunks c JOIN chatbot_documents d ON d.id = c.document_id
+                WHERE c.id IN ({placeholders})""",
+            ids,
+        )
+        by_id = {r["id"]: r for r in cur.fetchall()}
+    return [
+        {"id": i, "doc_id": by_id[i]["document_id"], "chunk_index": by_id[i]["chunk_index"],
+         "title": by_id[i]["title"], "text": by_id[i]["chunk_text"], "score": 1.0}
+        for i in ids if i in by_id
+    ]
 
 
 def get_document_by_title_fragment(conn, fragment: str) -> Optional[list[dict]]:
@@ -107,5 +162,4 @@ def get_document_by_title_fragment(conn, fragment: str) -> Optional[list[dict]]:
             (f"%{fragment}%",),
         )
         rows = cur.fetchall()
-    # même format que search_documents (clé "text") pour llm_service
     return [{"title": r["title"], "text": r["chunk_text"], "score": 1.0} for r in rows] or None

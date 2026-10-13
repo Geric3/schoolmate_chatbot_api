@@ -1,3 +1,5 @@
+import re
+import unicodedata
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -6,10 +8,25 @@ from security import AuthContext, get_auth_context
 from db import get_connection
 from models import ChatRequest, ChatResponse
 from services import moderation, intent_service, context_builder as cb
-from services import faq_service, rag_service, llm_service
+from services import faq_service, rag_service, llm_service, continuation_service
 
 router = APIRouter()
 
+# Intentions liées aux données PERSONNELLES : elles passent toujours avant les FAQs.
+PERSONAL_INTENTS = {"grades", "semester_validation", "notifications", "teacher_hours", "teacher_subjects"}
+_PERSONAL_RE = re.compile(r"\b(mes|mon|ma|my|dois|solde|reste|balance|owe)\b")
+STRONG_FAQ_SCORE = 0.75      # une FAQ très proche de la question passe avant les intentions « données »
+BATCH_SIZE = 4               # passages de document affichés par réponse
+MAX_RELEVANT_CHUNKS = 12     # passages pertinents conservés (le reste alimente « la suite »)
+
+
+def _plain(text: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", text.lower()) if unicodedata.category(c) != "Mn")
+
+
+def _reading_order(chunks: list[dict]) -> list[dict]:
+    """Remet les passages dans l'ordre du document pour que la réponse se lise naturellement."""
+    return sorted(chunks, key=lambda c: (c.get("doc_id") or 0, c.get("chunk_index") or 0))
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -34,32 +51,60 @@ def chat(req: ChatRequest, ctx: AuthContext = Depends(get_auth_context)):
             faq_service.log_interaction(conn, ctx.user_id, message, refusal)
             return ChatResponse(response=refusal, source="blocked")
 
+        # --- 1b. L'utilisateur répond « oui / non » à « voulez-vous la suite ? » ---
+        pending = continuation_service.get_pending(conn, ctx.role, ctx.user_id)
+        if pending:
+            if continuation_service.is_affirmative(message):
+                reply = _continue_document_answer(conn, ctx, lang, pending)
+                faq_service.log_interaction(conn, ctx.user_id, message, reply)
+                return ChatResponse(response=reply, source="documents")
+            continuation_service.clear_pending(conn, ctx.role, ctx.user_id)
+            if continuation_service.is_negative(message):
+                reply = continuation_service.DECLINED[lang]
+                faq_service.log_interaction(conn, ctx.user_id, message, reply)
+                return ChatResponse(response=reply, source="documents")
+            # sinon : c'est une nouvelle question, on poursuit normalement
+
         # --- 2. Structured intent -> live DB facts ---
         intent = intent_service.classify(message)
         answer, source = None, None
 
-        if intent and intent.name == "announcements":
-            answer, source = _handle_announcements(conn, ctx, message, lang)
-        elif intent and ctx.role == "student" and student:
-            answer, source = _handle_student_intent(conn, intent, message, lang, student)
-        elif intent and ctx.role == "teacher":
-            answer, source = _handle_teacher_intent(conn, intent, message, lang, ctx)
-        elif intent and ctx.role in ("admin", "university"):
-            answer, source = _handle_admin_intent(conn, intent, message, lang)
+        # 2a. Une FAQ rédigée par l'admin et très proche de la question est prioritaire,
+        #     sauf pour les questions sur les données personnelles de l'utilisateur.
+        personal = (intent and intent.name in PERSONAL_INTENTS) or _PERSONAL_RE.search(_plain(message))
+        if not personal:
+            strong = faq_service.find_best_faq(conn, message, lang, min_score=STRONG_FAQ_SCORE)
+            if strong:
+                answer, source = strong["answer"], "faq"
 
-        # --- 3. Local FAQ table ---
+        if not answer:
+            if intent and intent.name == "announcements":
+                answer, source = _handle_announcements(conn, ctx, message, lang)
+            elif intent and ctx.role == "student" and student:
+                answer, source = _handle_student_intent(conn, intent, message, lang, student)
+            elif intent and ctx.role == "teacher":
+                answer, source = _handle_teacher_intent(conn, intent, message, lang, ctx)
+            elif intent and ctx.role in ("admin", "university"):
+                answer, source = _handle_admin_intent(conn, intent, message, lang)
+
+        # --- 3. Local FAQ table (seuil normal) ---
         if not answer:
             faq_hit = faq_service.find_best_faq(conn, message, lang)
             if faq_hit:
                 answer, source = faq_hit["answer"], "faq"
 
-        # --- 4. Admin-uploaded documents (RAG) ---
+        # --- 4. Admin-uploaded documents (RAG) : première partie + « voulez-vous la suite ? » ---
         if not answer:
-            chunks = rag_service.search_documents(conn, message)
-            if chunks:
-                doc_answer = llm_service.answer_with_documents(lang, message, chunks)
+            ranked = rag_service.search_documents(conn, message, top_k=MAX_RELEVANT_CHUNKS, relative_min=0.6)
+            if ranked:
+                first, rest = ranked[:BATCH_SIZE], ranked[BATCH_SIZE:]
+                doc_answer = llm_service.answer_with_documents(lang, message, _reading_order(first))
                 if doc_answer:
                     answer, source = doc_answer, "documents"
+                    if rest:
+                        continuation_service.save_pending(
+                            conn, ctx.role, ctx.user_id, message, [c["id"] for c in rest], doc_answer)
+                        answer = f"{doc_answer}\n\n{continuation_service.FOLLOWUP[lang]}"
 
         # --- 5. General LLM fallback (out-of-scope or nothing matched) ---
         if not answer:
@@ -70,6 +115,33 @@ def chat(req: ChatRequest, ctx: AuthContext = Depends(get_auth_context)):
 
         faq_service.log_interaction(conn, ctx.user_id, message, answer)
         return ChatResponse(response=answer, source=source)
+
+
+# ---------------------------------------------------------------------------
+# Suite d'une réponse tirée des documents
+# ---------------------------------------------------------------------------
+
+def _continue_document_answer(conn, ctx, lang, pending) -> str:
+    ids = pending["chunk_ids"]
+    batch_ids, remaining = ids[:BATCH_SIZE], ids[BATCH_SIZE:]
+    chunks = rag_service.get_chunks_by_ids(conn, batch_ids)
+
+    answer = None
+    if chunks:
+        answer = llm_service.answer_with_documents(
+            lang, pending["question"], _reading_order(chunks), previous_answer=pending["last_answer"])
+
+    if not answer:
+        continuation_service.clear_pending(conn, ctx.role, ctx.user_id)
+        return continuation_service.NO_MORE[lang]
+
+    if remaining:
+        shown = (pending["last_answer"] + "\n" + answer)[-1500:]
+        continuation_service.save_pending(conn, ctx.role, ctx.user_id, pending["question"], remaining, shown)
+        return f"{answer}\n\n{continuation_service.FOLLOWUP[lang]}"
+
+    continuation_service.clear_pending(conn, ctx.role, ctx.user_id)
+    return answer
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +215,7 @@ def _handle_admin_intent(conn, intent, message, lang):
         return llm_service.polish_structured_answer(lang, message, stats), "structured_data"
     return None, None
 
+
 def _handle_announcements(conn, ctx, message, lang):
     audience = "students" if ctx.role == "student" else ("teachers" if ctx.role == "teacher" else "all")
     items = cb.get_announcements(conn, audience=audience)
@@ -150,7 +223,7 @@ def _handle_announcements(conn, ctx, message, lang):
         return llm_service.polish_structured_answer(lang, message, {"announcements": items}), "structured_data"
     chunks = rag_service.search_documents(conn, message)
     if chunks:
-        ans = llm_service.answer_with_documents(lang, message, chunks)
+        ans = llm_service.answer_with_documents(lang, message, _reading_order(chunks))
         if ans:
             return ans, "documents"
     return None, None

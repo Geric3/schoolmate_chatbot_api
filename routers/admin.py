@@ -53,7 +53,21 @@ def remove_faq(faq_id: int, ctx: AuthContext = Depends(_admin_only)):
 @router.get("/unanswered", response_model=List[UnansweredOut])
 def get_unanswered(ctx: AuthContext = Depends(_admin_only)):
     with get_connection(ctx.db_name) as conn:
-        return faq_service.list_unanswered(conn)
+        rows = faq_service.list_unanswered(conn)
+    return [
+        UnansweredOut(
+            id=r["id"],
+            question=r["question"],
+            answer=r.get("answer") or "",
+            timestamp=str(r["timestamp"]) if r.get("timestamp") else None,
+        )
+        for r in rows
+    ]
+
+# @router.get("/unanswered", response_model=List[UnansweredOut])
+# def get_unanswered(ctx: AuthContext = Depends(_admin_only)):
+#     with get_connection(ctx.db_name) as conn:
+#         return faq_service.list_unanswered(conn)
 
 
 @router.delete("/unanswered/{entry_id}")
