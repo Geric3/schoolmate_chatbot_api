@@ -1,5 +1,3 @@
-import re
-import unicodedata
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -12,16 +10,13 @@ from services import faq_service, rag_service, llm_service, continuation_service
 
 router = APIRouter()
 
-# Intentions liées aux données PERSONNELLES : elles passent toujours avant les FAQs.
-PERSONAL_INTENTS = {"grades", "semester_validation", "notifications", "teacher_hours", "teacher_subjects"}
-_PERSONAL_RE = re.compile(r"\b(mes|mon|ma|my|dois|solde|reste|balance|owe)\b")
-STRONG_FAQ_SCORE = 0.75      # une FAQ très proche de la question passe avant les intentions « données »
+# Intentions liées aux données propres à l'utilisateur : elles passent avant le RAG/FAQ.
+PERSONAL_INTENTS = {
+    "grades", "failed_courses", "semester_average", "semester_validation", "payment",
+    "courses", "teacher_lookup", "notifications", "teacher_hours", "teacher_subjects",
+}
 BATCH_SIZE = 4               # passages de document affichés par réponse
 MAX_RELEVANT_CHUNKS = 12     # passages pertinents conservés (le reste alimente « la suite »)
-
-
-def _plain(text: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFD", text.lower()) if unicodedata.category(c) != "Mn")
 
 
 def _reading_order(chunks: list[dict]) -> list[dict]:
@@ -65,37 +60,22 @@ def chat(req: ChatRequest, ctx: AuthContext = Depends(get_auth_context)):
                 return ChatResponse(response=reply, source="documents")
             # sinon : c'est une nouvelle question, on poursuit normalement
 
-        # --- 2. Structured intent -> live DB facts ---
+        # --- 2. Resolve authenticated, live user data before general knowledge ---
         intent = intent_service.classify(message)
         answer, source = None, None
+        personal = bool(intent and intent.name in PERSONAL_INTENTS)
+        if personal and ctx.role == "student" and student:
+            answer, source = _handle_student_intent(conn, intent, message, lang, student)
+        elif personal and ctx.role == "teacher":
+            answer, source = _handle_teacher_intent(conn, intent, message, lang, ctx)
+        elif intent and ctx.role in ("admin", "university"):
+            answer, source = _handle_admin_intent(conn, intent, message, lang)
 
-        # 2a. Une FAQ rédigée par l'admin et très proche de la question est prioritaire,
-        #     sauf pour les questions sur les données personnelles de l'utilisateur.
-        personal = (intent and intent.name in PERSONAL_INTENTS) or _PERSONAL_RE.search(_plain(message))
-        if not personal:
-            strong = faq_service.find_best_faq(conn, message, lang, min_score=STRONG_FAQ_SCORE)
-            if strong:
-                answer, source = strong["answer"], "faq"
-
-        if not answer:
-            if intent and intent.name == "announcements":
-                answer, source = _handle_announcements(conn, ctx, message, lang)
-            elif intent and ctx.role == "student" and student:
-                answer, source = _handle_student_intent(conn, intent, message, lang, student)
-            elif intent and ctx.role == "teacher":
-                answer, source = _handle_teacher_intent(conn, intent, message, lang, ctx)
-            elif intent and ctx.role in ("admin", "university"):
-                answer, source = _handle_admin_intent(conn, intent, message, lang)
-
-        # --- 3. Local FAQ table (seuil normal) ---
-        if not answer:
-            faq_hit = faq_service.find_best_faq(conn, message, lang)
-            if faq_hit:
-                answer, source = faq_hit["answer"], "faq"
-
-        # --- 4. Admin-uploaded documents (RAG) : première partie + « voulez-vous la suite ? » ---
-        if not answer:
-            ranked = rag_service.search_documents(conn, message, top_k=MAX_RELEVANT_CHUNKS, relative_min=0.6)
+        # --- 3. Institution documents are searched before FAQ/general Groq answers ---
+        if not answer and not personal:
+            ranked = rag_service.search_documents(
+                conn, message, top_k=MAX_RELEVANT_CHUNKS, min_score=0.15, relative_min=0.6,
+            )
             if ranked:
                 first, rest = ranked[:BATCH_SIZE], ranked[BATCH_SIZE:]
                 doc_answer = llm_service.answer_with_documents(lang, message, _reading_order(first))
@@ -105,6 +85,20 @@ def chat(req: ChatRequest, ctx: AuthContext = Depends(get_auth_context)):
                         continuation_service.save_pending(
                             conn, ctx.role, ctx.user_id, message, [c["id"] for c in rest], doc_answer)
                         answer = f"{doc_answer}\n\n{continuation_service.FOLLOWUP[lang]}"
+
+        # Announcements are live database records; use them only when no matching
+        # document passage answered the question, rather than returning unrelated latest items.
+        if not answer and intent and intent.name == "announcements":
+            answer, source = _handle_announcements(conn, ctx, message, lang)
+
+        if not answer and intent and ctx.role == "teacher" and not personal:
+            answer, source = _handle_teacher_intent(conn, intent, message, lang, ctx)
+
+        # --- 4. Local FAQ table ---
+        if not answer:
+            faq_hit = faq_service.find_best_faq(conn, message, lang)
+            if faq_hit:
+                answer, source = faq_hit["answer"], "faq"
 
         # --- 5. General LLM fallback (out-of-scope or nothing matched) ---
         if not answer:
@@ -152,12 +146,42 @@ def _handle_student_intent(conn, intent, message, lang, student):
     name = intent.name
 
     if name == "grades":
-        grades = cb.get_student_grades(conn, student["id"])
+        grades = cb.get_student_grades(
+            conn, student["id"], intent.entities.get("semester"),
+            intent.entities.get("academic_year"),
+        )
         if not grades:
             msg = ("Aucune note n'est encore enregistrée pour vous." if lang == "fr"
                    else "No grades are recorded for you yet.")
             return msg, "structured_data"
         return llm_service.polish_structured_answer(lang, message, {"grades": grades}), "structured_data"
+
+    if name in ("semester_average", "semester_validation"):
+        year = intent.entities.get("academic_year") or student["academic_year"]
+        summaries = cb.get_semester_summaries(
+            conn, student["id"], year, intent.entities.get("semester"),
+        )
+        if not summaries:
+            msg = ("Aucune note n'est encore enregistrée pour cette période."
+                   if lang == "fr" else "No grades are recorded for this period yet.")
+            return msg, "structured_data"
+        key = "semester_averages" if name == "semester_average" else "semester_validation"
+        return llm_service.polish_structured_answer(lang, message, {key: summaries}), "structured_data"
+
+    if name == "failed_courses":
+        grades = cb.get_student_grades(
+            conn, student["id"], intent.entities.get("semester"),
+            intent.entities.get("academic_year"),
+        )
+        failed = [grade for grade in grades
+                  if grade["total_on_100"] is not None and not grade["passed"]]
+        if not failed:
+            msg = ("Vous n'avez aucune matière à rattraper parmi les notes enregistrées."
+                   if lang == "fr" else "You have no subjects to retake among the recorded grades.")
+            return msg, "structured_data"
+        return llm_service.polish_structured_answer(
+            lang, message, {"subjects_to_retake": failed},
+        ), "structured_data"
 
     if name == "semester_validation":
         semester = intent.entities.get("semester") or "1"
@@ -169,18 +193,28 @@ def _handle_student_intent(conn, intent, message, lang, student):
         return llm_service.polish_structured_answer(lang, message, summary), "structured_data"
 
     if name == "courses":
-        courses = cb.get_student_courses(conn, student)
+        courses = cb.get_student_courses(
+            conn, student, intent.entities.get("semester"), intent.entities.get("academic_year"),
+        )
+        if not courses:
+            msg = ("Aucune matière n'a été trouvée pour cette période."
+                   if lang == "fr" else "No subjects were found for this period.")
+            return msg, "structured_data"
         return llm_service.polish_structured_answer(lang, message, {"courses": courses}), "structured_data"
 
     if name == "teacher_lookup":
-        fragment = intent.entities.get("subject_fragment", "")
-        teacher = cb.get_teacher_for_subject(conn, student, fragment) if fragment else None
-        if not teacher:
-            msg = ("Je n'ai pas trouvé d'enseignant pour cette matière. Vérifiez le nom exact du cours."
+        details = cb.get_student_teacher_subjects(
+            conn, student, intent.entities.get("teacher_fragment"),
+            intent.entities.get("semester"), intent.entities.get("academic_year"),
+        )
+        if not details:
+            msg = ("Je n'ai trouvé aucun enseignant ou cours correspondant dans votre programme."
                    if lang == "fr" else
-                   "I couldn't find a teacher for that subject. Please check the exact course name.")
+                   "I couldn't find a matching teacher or subject in your programme.")
             return msg, "structured_data"
-        return llm_service.polish_structured_answer(lang, message, teacher), "structured_data"
+        return llm_service.polish_structured_answer(
+            lang, message, {"teachers_and_subjects": details},
+        ), "structured_data"
 
     if name == "notifications":
         notifs = cb.get_notifications(conn, student["id"])
@@ -195,8 +229,11 @@ def _handle_teacher_intent(conn, intent, message, lang, ctx: AuthContext):
     if not teacher:
         return None, None
 
-    if name == "teacher_subjects":
-        subjects = cb.get_teacher_subjects(conn, ctx.user_id)
+    if name in ("teacher_subjects", "courses"):
+        subjects = cb.get_teacher_subjects(
+            conn, ctx.user_id, intent.entities.get("academic_year"),
+            intent.entities.get("semester"),
+        )
         return llm_service.polish_structured_answer(lang, message, {"subjects": subjects}), "structured_data"
 
     if name == "teacher_hours":

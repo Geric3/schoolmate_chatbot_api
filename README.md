@@ -11,20 +11,23 @@ message
   │
   ├─ 1. moderation.py   -> refuse instantly: password requests, or a
   │                          student asking about another student
-  ├─ 2. intent_service   -> regex match: grades / payment / courses /
-  │       + context_builder    semester validation / teacher lookup /
-  │                            announcements / teacher hours ... pulled
-  │                            LIVE from the tenant's MySQL DB, scoped to
-  │                            the caller's own id from the JWT
-  ├─ 3. faq_service      -> chatbot_faqs table (admin-managed)
-  ├─ 4. rag_service      -> chatbot_documents / chatbot_document_chunks
-  │                          (reglement interieur, admin-uploaded PDFs...)
-  └─ 5. llm_service      -> Groq or OpenAI, general-knowledge fallback
+  ├─ 2. intent_service   -> identifies personal requests (courses, grades,
+  │       + context_builder    semester average/validation, retakes, teacher
+  │                            for a subject, payment...) and reads only the
+  │                            authenticated user's permitted DB records
+  ├─ 3. rag_service      -> retrieves relevant passages from admin-uploaded
+  │                          institute documents before any general answer
+  ├─ 4. announcements / faq_service -> live announcements or managed FAQs
+  └─ 5. llm_service      -> Groq (or configured provider) for grounded
+                              document responses and general-knowledge fallback
 ```
 
 Every DB-backed answer is optionally "polished" by the LLM for tone, but the
 LLM is explicitly instructed to use ONLY the numbers it's given — it never
-invents a grade or a balance.
+invents a grade or a balance. Student course and grade questions can include
+an academic year and semester; without a year, course lists include available
+years and grade lists include all recorded years. Semester averages default to
+the student's current academic year when no year is specified.
 
 ## Setup
 

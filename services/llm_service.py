@@ -77,12 +77,17 @@ def polish_structured_answer(lang: str, user_question: str, facts: dict) -> str:
     user_msg = (
         f"Question de l'utilisateur : {user_question}\n\n"
         f"Données factuelles (source unique de vérité, ne rien inventer d'autre) :\n{facts}\n\n"
-        "Réponds dans un ton encourageant et bienveillant, en 2 à 5 phrases, dans la même "
-        "langue que la question." if lang == "fr" else
+        "Réponds dans la même langue que la question, avec un ton encourageant. "
+        "Quand les données contiennent une liste de matières, notes ou enseignants, "
+        "reprends chaque élément dans une liste lisible sans en omettre; conserve les "
+        "années, semestres, notes CC, notes d'examen et de rattrapage, totaux et moyennes. "
+        "N'ajoute aucun fait absent des données." if lang == "fr" else
         f"User question: {user_question}\n\n"
         f"Factual data (single source of truth, don't invent anything else):\n{facts}\n\n"
-        "Reply in an encouraging, supportive tone, in 2-5 sentences, in the same language "
-        "as the question."
+        "Reply in the same language as the question, in an encouraging tone. When the data "
+        "contains a list of subjects, grades or teachers, include every item in a readable "
+        "list; preserve academic years, semesters, continuous-assessment grades, exam grades, "
+        "retake grades, totals and averages. Do not add facts not present in the data."
     )
     messages = [{"role": "system", "content": system}, {"role": "user", "content": user_msg}]
     result = _dispatch(messages)

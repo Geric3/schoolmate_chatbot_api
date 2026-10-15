@@ -24,7 +24,12 @@ def get_student_profile(conn, student_id: int) -> Optional[dict]:
         return strip_sensitive_columns(row) if row else None
 
 
-def get_student_grades(conn, student_id: int, semester: Optional[str] = None) -> list[dict]:
+def get_student_grades(
+    conn,
+    student_id: int,
+    semester: Optional[str] = None,
+    academic_year: Optional[str] = None,
+) -> list[dict]:
     sql = """SELECT sub.subject_name, sub.subject_code, sub.coefficient,
                      r.continuous_score, r.exam_score, r.retake_score,
                      r.is_retake_passed, r.semester, r.academic_year
@@ -35,6 +40,9 @@ def get_student_grades(conn, student_id: int, semester: Optional[str] = None) ->
     if semester:
         sql += " AND r.semester = %s"
         params.append(semester)
+    if academic_year:
+        sql += " AND r.academic_year = %s"
+        params.append(academic_year)
     sql += " ORDER BY r.academic_year DESC, r.semester, sub.subject_name"
 
     with conn.cursor() as cur:
@@ -53,6 +61,7 @@ def get_student_grades(conn, student_id: int, semester: Optional[str] = None) ->
             "coefficient": r["coefficient"],
             "continuous_score": r["continuous_score"],
             "exam_score": exam,
+            "retake_score": r["retake_score"],
             "retaken": bool(r["is_retake_passed"]),
             "total_on_100": total,
             "passed": (total is not None and total >= 50),
@@ -62,36 +71,62 @@ def get_student_grades(conn, student_id: int, semester: Optional[str] = None) ->
     return graded
 
 
-def get_semester_validation(conn, student_id: int, semester: str, academic_year: str) -> dict:
-    grades = get_student_grades(conn, student_id, semester=semester)
-    grades = [g for g in grades if g["academic_year"] == academic_year]
-    weighted_sum, coef_sum = 0.0, 0
-    for g in grades:
-        if g["total_on_100"] is not None:
-            weighted_sum += g["total_on_100"] * g["coefficient"]
-            coef_sum += g["coefficient"]
-    average = round(weighted_sum / coef_sum, 2) if coef_sum else None
-    return {
-        "semester": semester,
-        "academic_year": academic_year,
-        "subjects_graded": len(grades),
-        "average": average,
-        "validated": (average is not None and average >= 50),
-    }
+def get_semester_summaries(
+    conn,
+    student_id: int,
+    academic_year: Optional[str] = None,
+    semester: Optional[str] = None,
+) -> list[dict]:
+    grades = get_student_grades(conn, student_id, semester, academic_year)
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for grade in grades:
+        if grade["total_on_100"] is not None:
+            key = (grade["academic_year"], str(grade["semester"]))
+            grouped.setdefault(key, []).append(grade)
 
-
-def get_student_courses(conn, student: dict) -> list[dict]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """SELECT sub.subject_name, sub.subject_code, sub.coefficient, sub.semester,
-                      t.firstname AS teacher_firstname, t.lastname AS teacher_lastname
-               FROM subjects sub
-               LEFT JOIN teachers t ON sub.teacher_id = t.id
-               WHERE sub.level = %s AND sub.field_of_study = %s
-                 AND sub.status = %s AND sub.academic_year = %s
-               ORDER BY sub.semester, sub.subject_name""",
-            (student["level"], student["field_of_study"], student["status"], student["academic_year"]),
+    summaries = []
+    for (year, term), term_grades in sorted(grouped.items(), reverse=True):
+        coefficient_sum = sum(float(g["coefficient"] or 0) for g in term_grades)
+        weighted_sum = sum(
+            g["total_on_100"] * float(g["coefficient"] or 0) for g in term_grades
         )
+        average = round(weighted_sum / coefficient_sum, 2) if coefficient_sum else None
+        summaries.append({
+            "academic_year": year,
+            "semester": term,
+            "subjects_graded": len(term_grades),
+            "average": average,
+            "validated": average is not None and average >= 50,
+        })
+    return summaries
+
+
+def get_student_courses(
+    conn,
+    student: dict,
+    semester: Optional[str] = None,
+    academic_year: Optional[str] = None,
+) -> list[dict]:
+    sql = """SELECT DISTINCT sub.subject_name, sub.subject_code, sub.coefficient, sub.semester,
+                    sub.academic_year,
+                    COALESCE(t.firstname, '') AS teacher_firstname,
+                    COALESCE(t.lastname, '') AS teacher_lastname
+             FROM subjects sub
+             LEFT JOIN teacher_subject ts
+               ON ts.subject_id = sub.id AND ts.academic_year = sub.academic_year
+             LEFT JOIN teachers t ON t.id = COALESCE(sub.teacher_id, ts.teacher_id)
+             WHERE sub.level = %s AND sub.field_of_study = %s
+               AND sub.status = %s"""
+    params = [student["level"], student["field_of_study"], student["status"]]
+    if semester:
+        sql += " AND sub.semester = %s"
+        params.append(semester)
+    if academic_year:
+        sql += " AND sub.academic_year = %s"
+        params.append(academic_year)
+    sql += " ORDER BY sub.academic_year DESC, sub.semester, sub.subject_name"
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
         return cur.fetchall()
 
 
@@ -109,6 +144,37 @@ def get_teacher_for_subject(conn, student: dict, subject_name_fragment: str) -> 
              student["academic_year"], f"%{subject_name_fragment}%"),
         )
         return cur.fetchone()
+
+
+def get_student_teacher_subjects(
+    conn,
+    student: dict,
+    teacher_fragment: Optional[str] = None,
+    semester: Optional[str] = None,
+    academic_year: Optional[str] = None,
+) -> list[dict]:
+    sql = """SELECT DISTINCT sub.subject_name, sub.subject_code, sub.semester,
+                    sub.academic_year, t.firstname, t.lastname, t.title, t.grade
+             FROM subjects sub
+             LEFT JOIN teacher_subject ts
+               ON ts.subject_id = sub.id AND ts.academic_year = sub.academic_year
+             JOIN teachers t ON t.id = COALESCE(sub.teacher_id, ts.teacher_id)
+             WHERE sub.level = %s AND sub.field_of_study = %s AND sub.status = %s"""
+    params = [student["level"], student["field_of_study"], student["status"]]
+    if semester:
+        sql += " AND sub.semester = %s"
+        params.append(semester)
+    if academic_year:
+        sql += " AND sub.academic_year = %s"
+        params.append(academic_year)
+    if teacher_fragment:
+        sql += """ AND (CONCAT_WS(' ', t.firstname, t.lastname) LIKE %s
+                         OR sub.subject_name LIKE %s)"""
+        params.extend((f"%{teacher_fragment}%", f"%{teacher_fragment}%"))
+    sql += " ORDER BY sub.academic_year DESC, t.lastname, t.firstname, sub.subject_name"
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
 
 
 def get_payment_summary(conn, student: dict) -> dict:
@@ -174,8 +240,13 @@ def get_teacher_profile(conn, teacher_id: int) -> Optional[dict]:
         return strip_sensitive_columns(row) if row else None
 
 
-def get_teacher_subjects(conn, teacher_id: int, academic_year: Optional[str] = None) -> list[dict]:
-    sql = """SELECT s.subject_name, s.subject_code, s.level, s.field_of_study,
+def get_teacher_subjects(
+    conn,
+    teacher_id: int,
+    academic_year: Optional[str] = None,
+    semester: Optional[str] = None,
+) -> list[dict]:
+    sql = """SELECT s.subject_name, s.subject_code, s.semester, s.level, s.field_of_study,
                      s.status, s.academic_year
               FROM teacher_subject ts
               JOIN subjects s ON ts.subject_id = s.id
@@ -184,6 +255,9 @@ def get_teacher_subjects(conn, teacher_id: int, academic_year: Optional[str] = N
     if academic_year:
         sql += " AND ts.academic_year = %s"
         params.append(academic_year)
+    if semester:
+        sql += " AND s.semester = %s"
+        params.append(semester)
     sql += " ORDER BY s.academic_year DESC, s.subject_name"
     with conn.cursor() as cur:
         cur.execute(sql, params)
